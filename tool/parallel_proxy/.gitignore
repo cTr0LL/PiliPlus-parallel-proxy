@@ -1,0 +1,4 @@
+# Signed, account-linked playback URLs. Never commit these.
+urls*.txt
+out.bin
+local_url.txt

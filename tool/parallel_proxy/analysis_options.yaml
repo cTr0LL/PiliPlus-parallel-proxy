@@ -1,0 +1,11 @@
+# Inherits the repo's configuration, with one rule relaxed.
+#
+# These harness scripts print long runs of consecutive stdout.writeln lines.
+# Collapsing them into cascades makes the output code harder to read and
+# produces worse diffs when a line is added or reordered, so cascade_invocations
+# is off here only. Everything else applies as usual.
+include: ../../analysis_options.yaml
+
+linter:
+  rules:
+    cascade_invocations: false
