@@ -9,6 +9,7 @@ import 'package:PiliPlus/common/widgets/scale_app.dart';
 import 'package:PiliPlus/common/widgets/scroll_behavior.dart';
 import 'package:PiliPlus/http/init.dart';
 import 'package:PiliPlus/models/common/theme/theme_color_type.dart';
+import 'package:PiliPlus/plugin/parallel_proxy/proxy_service.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/fullscreen.dart';
 import 'package:PiliPlus/router/app_pages.dart';
 import 'package:PiliPlus/services/account_service.dart';
@@ -92,6 +93,9 @@ Future<void> _initAppPath() async {
 void main() async {
   ScaledWidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
+  // Binds a loopback port for parallel CDN fetching. Swallows its own errors,
+  // and playback falls back to direct URLs if it did not come up.
+  await ProxyService.start();
   await _initAppPath();
   try {
     await GStorage.init();

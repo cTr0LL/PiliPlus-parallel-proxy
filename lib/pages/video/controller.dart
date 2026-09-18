@@ -47,6 +47,7 @@ import 'package:PiliPlus/pages/video/note/view.dart';
 import 'package:PiliPlus/pages/video/post_panel/view.dart';
 import 'package:PiliPlus/pages/video/send_danmaku/view.dart';
 import 'package:PiliPlus/pages/video/widgets/header_control.dart';
+import 'package:PiliPlus/plugin/parallel_proxy/proxy_service.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/heart_beat_type.dart';
@@ -691,7 +692,10 @@ class VideoDetailController extends GetxController
       ..buffered.value = 0;
 
     firstVideo = findVideoByQa(currentVideoQa.code, setCodecs: true);
-    videoUrl = VideoUtils.getCdnUrl(firstVideo.playUrls);
+    videoUrl = ProxyService.accelerate(
+      VideoUtils.getCdnUrl(firstVideo.playUrls),
+      firstVideo.playUrls,
+    );
 
     /// 根据currentAudioQa 重新设置audioUrl
     if (currentAudioQa != null) {
@@ -699,7 +703,11 @@ class VideoDetailController extends GetxController
         (i) => i.id == currentAudioQa!.code,
         orElse: () => data.dash!.audio!.first,
       );
-      audioUrl = VideoUtils.getCdnUrl(firstAudio.playUrls, isAudio: true);
+      audioUrl = ProxyService.accelerate(
+        VideoUtils.getCdnUrl(firstAudio.playUrls, isAudio: true),
+        firstAudio.playUrls,
+        isAudio: true,
+      );
     }
 
     playerInit();
@@ -960,7 +968,10 @@ class VideoDetailController extends GetxController
       );
       _setVideoHeight();
 
-      videoUrl = VideoUtils.getCdnUrl(firstVideo.playUrls);
+      videoUrl = ProxyService.accelerate(
+        VideoUtils.getCdnUrl(firstVideo.playUrls),
+        firstVideo.playUrls,
+      );
 
       /// 优先顺序 设置中指定质量 -> 当前可选的最高质量
       AudioItem? firstAudio;
@@ -979,7 +990,11 @@ class VideoDetailController extends GetxController
           (e) => e.id == closestNumber,
           orElse: () => audioList.first,
         );
-        audioUrl = VideoUtils.getCdnUrl(firstAudio.playUrls, isAudio: true);
+        audioUrl = ProxyService.accelerate(
+          VideoUtils.getCdnUrl(firstAudio.playUrls, isAudio: true),
+          firstAudio.playUrls,
+          isAudio: true,
+        );
         currentAudioQa = AudioQuality.fromCode(firstAudio.id);
       } else {
         audioUrl = '';
