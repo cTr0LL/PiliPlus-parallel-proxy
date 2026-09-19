@@ -20,6 +20,11 @@ if (!isBuiltInKotlinEnabled) {
 android {
     namespace = "com.example.piliplus"
     compileSdk = 37
+    // The SDK repository no longer publishes a bare `platforms;android-37`,
+    // only minor-versioned ones (37.0, 37.1, 37.2). Without this, AGP asks for
+    // hash string "android-37" and the build fails with "Failed to find
+    // target". Selecting a minor version is an AGP 9 feature.
+    compileSdkMinor = 0
     ndkVersion = flutter.ndkVersion
 
     compileOptions {

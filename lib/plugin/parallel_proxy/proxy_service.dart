@@ -23,21 +23,40 @@ abstract final class ProxyService {
   // TODO: surface in settings and persist via Pref.
   static bool enabled = true;
 
-  /// Measure with `parallel_proxy/bin/bench.dart` rather than guessing; the
-  /// useful value is a property of the route. Audio gets far less because it
-  /// carries ~2% of the video bitrate and would otherwise be mostly handshakes.
-  static int videoConcurrency = 16;
-  static int audioConcurrency = 4;
+  /// Deliberately lower than the 16 that `tool/parallel_proxy/bench.dart`
+  /// measured as optimal, because raw throughput is not the binding constraint
+  /// during playback.
+  ///
+  /// mpv's demuxer cache here is 4 MiB (`demuxer-max-bytes`), so anything
+  /// beyond `concurrency * chunkSize` of read-ahead is fetched and then thrown
+  /// away on the next seek. And a seek supersedes the session, which cancels
+  /// every in-flight fetch - a cancelled response cannot be kept alive, so each
+  /// one destroys a TLS connection and the next session opens that many again.
+  /// Seek-heavy content (a 合集, where position is restored between parts) then
+  /// churns connections fast enough that the CDN simply stops answering:
+  /// chunks time out at 0 bytes received.
+  ///
+  /// 8 x 512 KiB = 4 MiB in flight, matching what the player will actually
+  /// hold, which makes a seek cheap to abandon.
+  static int videoConcurrency = 8;
+  static int audioConcurrency = 2;
+  static int chunkSize = 512 << 10;
 
   static ParallelProxy? _proxy;
 
   /// Recent registrations, oldest first. Quality switches and playurl refreshes
   /// register again, so without this the token map would grow for the life of
-  /// the app. Kept deliberately slack: a switch can leave the player briefly
-  /// reading the previous URL, and unregistering it out from under mpv would
-  /// stall playback.
+  /// the app.
+  ///
+  /// Four, because PiliPlus registers exactly two per video (the DASH video and
+  /// audio tracks), so this holds the current video plus the previous one. That
+  /// is the slack needed for a switch, and no more: eviction is what cancels an
+  /// abandoned stream's in-flight fetches, and every video kept beyond the
+  /// current one is a stream that may still be consuming the per-host
+  /// connection budget. At six, the fifth video in a row could not get
+  /// connections and failed to open.
   static final List<String> _recent = [];
-  static const _keepRegistrations = 6;
+  static const _keepRegistrations = 4;
 
   static Map<String, String> get _headers => const {
     'Referer': HttpString.baseUrl,
@@ -54,8 +73,14 @@ abstract final class ProxyService {
       final proxy = ParallelProxy(
         config: ParallelProxyConfig(
           concurrency: videoConcurrency,
-          // Video and audio usually share a CDN host, so this must cover both.
-          maxConnectionsPerHost: videoConcurrency + audioConcurrency + 8,
+          chunkSize: chunkSize,
+          // Must cover every stream in flight at once, not one: the DASH video
+          // and audio tracks share a CDN host, and during a switch the previous
+          // video's registrations are still alive. Two videos' worth, plus
+          // headroom for the length probes.
+          maxConnectionsPerHost:
+              (videoConcurrency + audioConcurrency) * 2 + 8,
+          onLog: kDebugMode ? (m) => debugPrint('ParallelProxy $m') : null,
         ),
       );
       await proxy.start();
@@ -101,9 +126,25 @@ abstract final class ProxyService {
         concurrency: isAudio ? audioConcurrency : videoConcurrency,
       );
 
+      if (kDebugMode) {
+        debugPrint(
+          'ParallelProxy register ${local.split('/').last.substring(0, 8)} '
+          '${isAudio ? 'audio' : 'video'} '
+          'host=${Uri.parse(direct).host} '
+          'mirrors=${backups.length} '
+          'conc=${isAudio ? audioConcurrency : videoConcurrency}',
+        );
+      }
+
       _recent.add(local);
       while (_recent.length > _keepRegistrations) {
-        proxy.unregister(_recent.removeAt(0));
+        final dropped = _recent.removeAt(0);
+        if (kDebugMode) {
+          debugPrint(
+            'ParallelProxy evict ${dropped.split('/').last.substring(0, 8)}',
+          );
+        }
+        proxy.unregister(dropped);
       }
       return local;
     } catch (e) {

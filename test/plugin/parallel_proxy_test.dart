@@ -77,7 +77,11 @@ void main() {
           'audio carries ~2% of the bitrate and should not spend the '
           'video budget on TLS handshakes',
     );
-    expect(audioPeak, lessThanOrEqualTo(ProxyService.audioConcurrency));
+    // +1 for the length probe. It is aborted rather than drained, because
+    // draining blocks forever against a node that answers and then stalls
+    // without closing, so it is no longer guaranteed to have finished tearing
+    // down before the chunk fetches begin.
+    expect(audioPeak, lessThanOrEqualTo(ProxyService.audioConcurrency + 1));
   });
 
   test('falls back to the direct url when disabled', () async {
