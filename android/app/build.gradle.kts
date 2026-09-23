@@ -60,9 +60,10 @@ android {
     }
 
     buildFeatures {
-        if (project.hasProperty("dev")) {
-            resValues = true
-        }
+        // Unconditional, not just under -Pdev: this fork overrides app_name in
+        // release builds too, and AGP refuses a resValue when the feature is
+        // off ("contains custom resource values, but the feature is disabled").
+        resValues = true
     }
 
     buildTypes {
@@ -76,6 +77,19 @@ android {
                     type = "string",
                     name = "app_name",
                     value = "PiliPlus dev",
+                )
+            } else {
+                // This fork is signed with a different key from upstream, and
+                // Android identifies an app by package id: sharing upstream's
+                // would make the two mutually uninstallable - installing either
+                // over the other fails on signature mismatch, taking the user's
+                // login and settings with it. A distinct id lets both sit side
+                // by side, which also makes them comparable.
+                applicationIdSuffix = ".proxy"
+                resValue(
+                    type = "string",
+                    name = "app_name",
+                    value = "PiliPlus 多线程",
                 )
             }
 //            proguardFiles(
