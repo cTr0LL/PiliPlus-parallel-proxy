@@ -136,6 +136,46 @@ void main() {
     final status = await _statusOf(first);
     expect(status, 404, reason: 'evicted registrations should not linger');
   });
+  group('host pool', () {
+    const signed =
+        'https://upos-sz-mirrorali.bilivideo.com/upgcxcode/12/34/x.m4s?e=sig';
+
+    test('rewrites the signed path onto the other known hosts', () {
+      ProxyService.useHostPool = true;
+      final out = ProxyService.mirrorsFor(signed, const []);
+
+      expect(out, isNotEmpty);
+      // Never itself, or a chunk could 'fail over' to the host that failed.
+      expect(
+        out.any((u) => Uri.parse(u).host == 'upos-sz-mirrorali.bilivideo.com'),
+        isFalse,
+      );
+      // The signature lives in the query, so it must survive the swap.
+      expect(out.every((u) => u.contains('upgcxcode/12/34/x.m4s')), isTrue);
+      expect(out.every((u) => u.contains('e=sig')), isTrue);
+    });
+
+    test('leaves urls that are not signed upos paths alone', () {
+      ProxyService.useHostPool = true;
+      const other = 'https://example.com/video.mp4';
+      expect(ProxyService.mirrorsFor(other, const []), isEmpty);
+    });
+
+    test('keeps the urls bilibili supplied, without duplicates', () {
+      ProxyService.useHostPool = true;
+      const backup =
+          'https://upos-hz-mirrorakam.akamaized.net/upgcxcode/12/34/x.m4s?e=sig';
+      final out = ProxyService.mirrorsFor(signed, const [backup, backup]);
+      expect(out.where((u) => u == backup).length, 1);
+      expect(out.toSet().length, out.length);
+    });
+
+    test('adds nothing when the pool is off', () {
+      ProxyService.useHostPool = false;
+      addTearDown(() => ProxyService.useHostPool = true);
+      expect(ProxyService.mirrorsFor(signed, const []), isEmpty);
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------

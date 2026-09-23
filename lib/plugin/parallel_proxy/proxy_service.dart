@@ -1,7 +1,10 @@
 import 'package:PiliPlus/http/browser_ua.dart';
 import 'package:PiliPlus/http/constants.dart';
+import 'package:PiliPlus/models/common/video/cdn_type.dart';
 import 'package:PiliPlus/plugin/parallel_proxy/parallel_proxy.dart';
-import 'package:flutter/foundation.dart' show kDebugMode, debugPrint;
+import 'package:PiliPlus/plugin/parallel_proxy/proxy_telemetry.dart';
+import 'package:flutter/foundation.dart'
+    show kDebugMode, debugPrint, visibleForTesting;
 
 /// Owns the loopback proxy that fetches CDN media in parallel byte ranges.
 ///
@@ -42,6 +45,44 @@ abstract final class ProxyService {
   static int audioConcurrency = 2;
   static int chunkSize = 512 << 10;
 
+  /// Whether to manufacture a pool of CDN hosts by rewriting the signed URL's
+  /// hostname, and spread chunks across it - one or two connections per host
+  /// rather than the whole window at one.
+  ///
+  /// This is what Bilibili-thread-ripper does: its resolver rotates a cursor
+  /// per concurrent worker over frozen MAINLAND_HOSTS / OVERSEAS_HOSTS lists,
+  /// so N threads land on N nodes. It addresses a different problem from
+  /// parallelism - bilibili's caching is tiered, and an unpopular video is
+  /// simply absent from some edges, so asking a DIFFERENT node can beat asking
+  /// the same node harder. It also avoids the per-host rate limiting that
+  /// answered our 8-connections-on-one-host bursts with 503s.
+  ///
+  /// Kept as a switch so it can be A/B'd against single-host on real telemetry,
+  /// since the desktop benchmark that argued for single-host only ever measured
+  /// a warm object across two overseas mirrors.
+  static bool useHostPool = true;
+
+  /// Hosts the signed URL may be rewritten to, mainland first: cold data is
+  /// likelier to be resident there, which is the case single-host handles worst.
+  /// Unreachable ones cost one connect timeout each and are then blocked by the
+  /// proxy's shared per-host health, so listing optimistically is cheap.
+  static final List<String> poolHosts = [
+    for (final e in const [
+      CDNService.ali,
+      CDNService.alib,
+      CDNService.cos,
+      CDNService.cosb,
+      CDNService.hw,
+      CDNService.hwb,
+      CDNService.hw_08c,
+      CDNService.aliov,
+      CDNService.cosov,
+      CDNService.hwov,
+      CDNService.akamai,
+    ])
+      if (e.host != null) e.host!,
+  ];
+
   static ParallelProxy? _proxy;
 
   /// Recent registrations, oldest first. Quality switches and playurl refreshes
@@ -78,9 +119,13 @@ abstract final class ProxyService {
           // and audio tracks share a CDN host, and during a switch the previous
           // video's registrations are still alive. Two videos' worth, plus
           // headroom for the length probes.
-          maxConnectionsPerHost:
-              (videoConcurrency + audioConcurrency) * 2 + 8,
+          maxConnectionsPerHost: (videoConcurrency + audioConcurrency) * 2 + 8,
+          spreadAcrossMirrors: useHostPool,
           onLog: kDebugMode ? (m) => debugPrint('ParallelProxy $m') : null,
+          // Persisted in release builds too: this is what makes it possible to
+          // answer "was it slow or broken" after days of ordinary use, when
+          // logcat has long since wrapped.
+          onSession: ProxyTelemetry.record,
         ),
       );
       await proxy.start();
@@ -95,6 +140,7 @@ abstract final class ProxyService {
   }
 
   static Future<void> stop() async {
+    await ProxyTelemetry.close();
     final proxy = _proxy;
     _proxy = null;
     _recent.clear();
@@ -117,13 +163,14 @@ abstract final class ProxyService {
       // getCdnUrl may rewrite the host to the user's preferred CDN, so the
       // chosen URL is not necessarily one of the originals. Everything else
       // becomes failover.
-      final backups = mirrors.where((u) => u != direct).toList();
+      final backups = mirrorsFor(direct, mirrors);
 
       final local = proxy.register(
         url: direct,
         backupUrls: backups,
         headers: _headers,
         concurrency: isAudio ? audioConcurrency : videoConcurrency,
+        kind: isAudio ? 'audio' : 'video',
       );
 
       if (kDebugMode) {
@@ -152,4 +199,32 @@ abstract final class ProxyService {
       return direct;
     }
   }
+
+  /// Everything to try besides [direct]: the urls bilibili supplied, plus -
+  /// when [useHostPool] is on - the same signed path rewritten onto the other
+  /// known CDN hosts.
+  ///
+  /// Rewriting is only valid for the upos mirror URLs, which carry their
+  /// signature in query parameters rather than in the hostname; anything else
+  /// is passed through untouched.
+  @visibleForTesting
+  static List<String> mirrorsFor(String direct, Iterable<String> supplied) {
+    final out = <String>{...supplied.where((u) => u != direct)};
+
+    if (useHostPool) {
+      final uri = Uri.tryParse(direct);
+      if (uri != null && _isSwappable(uri)) {
+        for (final host in poolHosts) {
+          if (host == uri.host) continue;
+          out.add(uri.replace(host: host).toString());
+        }
+      }
+    }
+    return out.toList();
+  }
+
+  static bool _isSwappable(Uri uri) =>
+      uri.path.contains('/upgcxcode/') &&
+      (uri.host.endsWith('.bilivideo.com') ||
+          uri.host.endsWith('.akamaized.net'));
 }

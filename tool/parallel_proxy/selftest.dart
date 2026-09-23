@@ -296,6 +296,40 @@ Future<void> main() async {
   await picky.stop();
   await flaky.close(force: true);
 
+  // 18. Head-of-line hedging. A node that TRICKLES bytes never trips the idle
+  //     watchdog, so timeouts cannot rescue it - yet delivery is strictly
+  //     ordered, so it stalls the whole stream while healthy chunks sit
+  //     complete and undeliverable. The fix is to duplicate the late chunk
+  //     onto another host and take whichever answers first.
+  final trickle = await _startTrickleOrigin();
+  final hedging = ParallelProxy(
+    config: const ParallelProxyConfig(
+      concurrency: 2,
+      chunkSize: 512 << 10,
+      scheduleStagger: Duration.zero,
+      hedgeAfter: Duration(milliseconds: 300),
+      chunkTimeout: Duration(seconds: 30),
+    ),
+  );
+  await hedging.start();
+  final hedgedUrl = hedging.register(
+    url: 'http://127.0.0.1:${trickle.port}/file',
+    backupUrls: [goodUrl],
+  );
+  final hedgeWatch = Stopwatch()..start();
+  final r18 = await _get(hedgedUrl, range: 'bytes=0-${(1 << 20) - 1}')
+      .timeout(const Duration(seconds: 20),
+          onTimeout: () => _Response(0, const []));
+  hedgeWatch.stop();
+  _check('hedging: served despite a trickling primary',
+      r18.bytes.length == (1 << 20) && _same(r18.bytes, 0),
+      'got ${r18.bytes.length} bytes');
+  _check('hedging: did not wait out the slow node',
+      hedgeWatch.elapsedMilliseconds < 6000,
+      'took ${hedgeWatch.elapsedMilliseconds}ms; the trickle alone would need far longer');
+  await hedging.stop();
+  await trickle.close(force: true);
+
   await proxy.stop();
   await origin.close(force: true);
   await badMirror.close(force: true);
@@ -400,6 +434,42 @@ Future<HttpServer> _startIntermittentOrigin({required int failEvery}) async {
     res.contentLength = end - start + 1;
     res.add(Uint8List.sublistView(_body, start, end + 1));
     await res.close();
+  });
+  return server;
+}
+
+/// Answers correctly but dribbles the body out a few KiB at a time.
+///
+/// Deliberately never idle long enough to trip the body watchdog: this is the
+/// failure timeouts cannot catch, and the reason hedging exists.
+Future<HttpServer> _startTrickleOrigin() async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  server.listen((req) async {
+    final res = req.response;
+    final header = req.headers.value(HttpHeaders.rangeHeader);
+    final m = header == null
+        ? null
+        : RegExp(r'^bytes=(\d+)-(\d*)\$').firstMatch(header.trim());
+    final start = m == null ? 0 : int.parse(m.group(1)!);
+    final end = (m == null || m.group(2)!.isEmpty)
+        ? _size - 1
+        : min(int.parse(m.group(2)!), _size - 1);
+    res.statusCode = 206;
+    res.headers.set(HttpHeaders.contentRangeHeader, 'bytes \$start-\$end/\$_size');
+    res.contentLength = end - start + 1;
+    try {
+      var at = start;
+      while (at <= end) {
+        final stop = min(at + 4096, end + 1);
+        res.add(Uint8List.sublistView(_body, at, stop));
+        await res.flush();
+        await Future<void>.delayed(const Duration(milliseconds: 120));
+        at = stop;
+      }
+      await res.close();
+    } catch (_) {
+      // Cancelled by the hedge winning; that is the expected outcome.
+    }
   });
   return server;
 }

@@ -20,6 +20,7 @@ class ParallelProxyConfig {
     this.spreadAcrossMirrors = false,
     this.maxConnectionsPerHost,
     this.onLog,
+    this.onSession,
     this.maxAttemptsPerChunk = 5,
     this.tcpConnectTimeout = const Duration(seconds: 4),
     this.connectTimeout = const Duration(seconds: 20),
@@ -28,6 +29,10 @@ class ParallelProxyConfig {
     this.retryBackoff = const Duration(milliseconds: 250),
     this.maxRetryBackoff = const Duration(seconds: 4),
     this.scheduleStagger = const Duration(milliseconds: 25),
+    this.hedgeChunks = true,
+    this.hedgeAfter = const Duration(milliseconds: 1500),
+    this.maxHedgeAfter = const Duration(seconds: 8),
+    this.hedgeMultiplier = 2.5,
     this.mirrorPenalty = const Duration(seconds: 30),
     this.maxHostBlock = const Duration(minutes: 5),
   });
@@ -89,6 +94,16 @@ class ParallelProxyConfig {
   /// never tried, and the only way to tell them apart is reading socket tables.
   final void Function(String message)? onLog;
 
+  /// Called once per served request with a compact summary: how long the first
+  /// byte took, how much was served, which hosts were used, and how many
+  /// failures of each kind.
+  ///
+  /// Separate from [onLog] because it is meant to be PERSISTED in release
+  /// builds. Line-per-playback rather than line-per-request keeps weeks of
+  /// ordinary use small enough to read in one sitting, and it is the shape that
+  /// answers "was it slow or was it broken" - which raw request logs do not.
+  final void Function(Map<String, Object?> record)? onSession;
+
   final int maxAttemptsPerChunk;
 
   /// Ceiling on opening the TCP/TLS connection itself.
@@ -128,6 +143,20 @@ class ParallelProxyConfig {
   /// when it is asking to be hit less.
   final Duration retryBackoff;
   final Duration maxRetryBackoff;
+
+  /// Whether a head-of-line chunk that falls behind is duplicated onto another
+  /// host, first answer winning.
+  final bool hedgeChunks;
+
+  /// Floor on how late a chunk must be before hedging, and the ceiling that
+  /// [hedgeMultiplier] is clamped to.
+  final Duration hedgeAfter;
+  final Duration maxHedgeAfter;
+
+  /// Multiple of the stream's own median chunk time at which a chunk counts as
+  /// late. Relative rather than absolute so a uniformly slow link is not hedged
+  /// on every chunk - only genuine outliers are.
+  final double hedgeMultiplier;
 
   /// Gap between opening each connection in the initial window. Opening the
   /// whole window in one tick looks like a burst to the far end; spreading it
@@ -195,8 +224,12 @@ class _HostHealth {
     if (consecutiveFailures > 0) consecutiveFailures--;
   }
 }
+
 class _Upstream {
-  _Upstream(this.mirrors, this.headers, this.concurrency);
+  _Upstream(this.mirrors, this.headers, this.concurrency, this.kind);
+
+  /// 'video' or 'audio'. Recorded so telemetry can separate the two tracks.
+  final String kind;
 
   final List<Uri> mirrors;
   final Map<String, String> headers;
@@ -218,24 +251,26 @@ class _Upstream {
   /// consuming the per-host connection budget. Enough abandoned streams and a
   /// NEW video cannot get connections and fails to open at all.
   final Set<_Session> sessions = {};
-
 }
 
-/// Per-client-request state. One [_Session] exists for each GET the player
-/// makes; when the player seeks it drops the socket and a new session starts.
-class _Session {
-  _Session(this.upstream);
+/// One attempt at one byte range, cancellable on its own.
+///
+/// Separate from [_Session] because hedging runs TWO fetches for the same
+/// range and must be able to abandon the loser without disturbing the rest of
+/// the stream.
+class _ChunkJob {
+  _ChunkJob(this.start, this.end);
 
-  final _Upstream upstream;
+  final int start;
+  final int end;
+
+  /// Host of the most recent attempt, so a hedge can be sent somewhere else.
+  String? lastHost;
+
   bool cancelled = false;
-
-  /// Abort hooks for the requests this session has in flight.
-  ///
-  /// Setting [cancelled] alone is not enough: a request still waiting on
-  /// response headers has no data event to observe the flag, so it holds its
-  /// connection until the connect timeout expires - precisely when a seek
-  /// needs those connections back. Aborting releases them at once.
   final Set<void Function()> aborts = {};
+
+  late final Future<Uint8List> future;
 
   void cancel() {
     cancelled = true;
@@ -243,6 +278,65 @@ class _Session {
       abort();
     }
     aborts.clear();
+  }
+}
+/// Per-client-request state. One [_Session] exists for each GET the player
+/// makes; when the player seeks it drops the socket and a new session starts.
+class _Session {
+  _Session(this.upstream, this.kind);
+
+  final _Upstream upstream;
+
+  /// 'video' or 'audio', carried only so the telemetry record can say which.
+  final String kind;
+
+  final Stopwatch clock = Stopwatch()..start();
+  int? firstByteMs;
+  int bytesServed = 0;
+  int chunksOk = 0;
+  final Map<String, int> failures = {};
+  final Set<String> hostsUsed = {};
+
+  void countFailure(Object error) {
+    final key = switch (error) {
+      _BadMirror() => 'badmirror',
+      SocketException() => 'connect',
+      TimeoutException() => 'connect',
+      HttpException(message: final m) when m.contains('stalled') => 'stall',
+      HttpException() => 'drop',
+      _ => 'other',
+    };
+    failures[key] = (failures[key] ?? 0) + 1;
+  }
+
+  bool cancelled = false;
+
+  /// Jobs this session has in flight.
+  ///
+  /// Cancelling has to reach the requests themselves: one still waiting on
+  /// response headers has no data event to observe a flag, so it would hold its
+  /// connection until the connect timeout expires - precisely when a seek needs
+  /// those connections back.
+  final Set<_ChunkJob> jobs = {};
+
+  int hedges = 0;
+  int hedgeWins = 0;
+
+  /// Completion times of finished chunks, used to decide when one is late
+  /// enough to be worth hedging. Bounded: only the recent shape matters.
+  final List<int> chunkMs = [];
+
+  void noteChunkMs(int ms) {
+    chunkMs.add(ms);
+    if (chunkMs.length > 16) chunkMs.removeAt(0);
+  }
+
+  void cancel() {
+    cancelled = true;
+    for (final job in jobs.toList()) {
+      job.cancel();
+    }
+    jobs.clear();
   }
 }
 
@@ -317,6 +411,7 @@ class ParallelProxy {
     List<String> backupUrls = const [],
     Map<String, String> headers = const {},
     int? concurrency,
+    String kind = 'video',
   }) {
     if (_server == null) {
       throw StateError('ParallelProxy.start() must be awaited first');
@@ -335,6 +430,7 @@ class ParallelProxy {
       mirrors,
       Map.unmodifiable(headers),
       concurrency ?? config.concurrency,
+      kind,
     );
     return 'http://127.0.0.1:$port/v/$token';
   }
@@ -397,7 +493,7 @@ class ParallelProxy {
       upstream.sessions.clear();
     }
 
-    final session = _Session(upstream);
+    final session = _Session(upstream, upstream.kind);
     upstream.sessions.add(session);
     // The player seeking == the player closing this socket. Flag it so the
     // in-flight chunk fetches abort instead of finishing work nobody wants.
@@ -441,19 +537,47 @@ class ParallelProxy {
 
     if (req.method == 'HEAD') return res.close();
 
+    var outcome = 'ok';
     try {
       await _pump(session, range, res);
     } on _Cancelled {
       // Expected on every seek.
+      outcome = 'superseded';
     } catch (_) {
       // Half-written body; closing is all we can do, the player will retry.
+      outcome = 'failed';
     } finally {
       session.cancelled = true;
       upstream.sessions.remove(session);
+      _emitSession(session, tag, outcome);
       try {
         await res.close();
       } catch (_) {}
     }
+  }
+
+  void _emitSession(_Session session, String tag, String outcome) {
+    final sink = config.onSession;
+    if (sink == null) return;
+    final ms = session.clock.elapsedMilliseconds;
+    sink({
+      't': DateTime.now().toIso8601String(),
+      'tok': tag,
+      'kind': session.kind,
+      'outcome': outcome,
+      'ttfb_ms': session.firstByteMs,
+      'bytes': session.bytesServed,
+      'ms': ms,
+      // Only meaningful once something was actually served.
+      'kbps': (session.bytesServed > 0 && ms > 0)
+          ? (session.bytesServed * 8 / ms).round()
+          : null,
+      'chunks_ok': session.chunksOk,
+      if (session.hedges > 0) 'hedges': session.hedges,
+      if (session.hedges > 0) 'hedge_wins': session.hedgeWins,
+      'hosts': session.hostsUsed.toList(),
+      if (session.failures.isNotEmpty) 'fail': session.failures,
+    });
   }
 
   /// Streams [range] to [res] in order, keeping this upstream's concurrency
@@ -469,12 +593,20 @@ class ParallelProxy {
     HttpResponse res,
   ) async {
     if (range.length < config.minParallelSize) {
-      res.add(await _fetchChunk(session, range.start, range.end));
+      // Small reads (FFmpeg's header probe) go on one connection; there is
+      // nothing to order and nothing to hedge.
+      final only = _ChunkJob(range.start, range.end);
+      session.jobs.add(only);
+      try {
+        res.add(await _fetchChunk(session, only));
+      } finally {
+        session.jobs.remove(only);
+      }
       await res.flush();
       return;
     }
 
-    final inFlight = Queue<Future<Uint8List>>();
+    final inFlight = Queue<_ChunkJob>();
     var nextOffset = range.start;
     // Only the opening burst is staggered. Once bytes are flowing, chunks are
     // scheduled one at a time as earlier ones complete, which is already
@@ -482,7 +614,10 @@ class ParallelProxy {
     var openingBurst = true;
     // Slow start. Widens on every completed chunk, so a warm stream reaches
     // full width within a few chunks while a cold one is not hammered.
-    var window = config.initialConcurrency.clamp(1, session.upstream.concurrency);
+    var window = config.initialConcurrency.clamp(
+      1,
+      session.upstream.concurrency,
+    );
 
     try {
       while (nextOffset <= range.end || inFlight.isNotEmpty) {
@@ -490,22 +625,28 @@ class ParallelProxy {
             nextOffset <= range.end &&
             !session.cancelled) {
           final end = min(nextOffset + config.chunkSize - 1, range.end);
-          final chunk = (openingBurst && inFlight.isNotEmpty)
-              ? _staggered(session, nextOffset, end, inFlight.length)
-              : _fetchChunk(session, nextOffset, end);
+          final job = _ChunkJob(nextOffset, end);
+          session.jobs.add(job);
+          job.future = (openingBurst && inFlight.isNotEmpty)
+              ? _staggered(session, job, inFlight.length)
+              : _fetchChunk(session, job);
           // Attach a listener now, not just in `finally`: while the pump is
           // blocked on flush these are not being awaited, so a cancellation
           // would otherwise escape as an unhandled async error.
-          unawaited(chunk.then((_) {}, onError: (_) {}));
-          inFlight.add(chunk);
+          unawaited(job.future.then((_) {}, onError: (_) {}));
+          inFlight.add(job);
           nextOffset = end + 1;
         }
         if (inFlight.isEmpty) break;
 
-        final bytes = await inFlight.removeFirst();
+        final head = inFlight.removeFirst();
+        final bytes = await _awaitHead(session, head);
+        session.jobs.remove(head);
         if (session.cancelled) throw const _Cancelled();
 
         res.add(bytes);
+        session.firstByteMs ??= session.clock.elapsedMilliseconds;
+        session.bytesServed += bytes.length;
         openingBurst = false;
         // Bytes arrived, so the far end is willing to serve us: widen.
         window = min(session.upstream.concurrency, window * 2);
@@ -516,12 +657,92 @@ class ParallelProxy {
       session.cancelled = true;
       // Futures are not cancellable; the flag aborts them at their next read.
       // Swallow their errors so they do not surface as unhandled.
-      for (final f in inFlight) {
-        unawaited(f.then((_) {}, onError: (_) {}));
+      for (final job in inFlight) {
+        job.cancel();
+        unawaited(job.future.then((_) {}, onError: (_) {}));
       }
     }
   }
 
+  /// Waits for the head-of-line chunk, starting a duplicate on another host if
+  /// it falls badly behind its peers.
+  ///
+  /// Delivery is strictly ordered - the player reads one sequential stream - so
+  /// a single slow node stalls everything: seven healthy chunks can be sitting
+  /// complete in memory, undeliverable, while the window stays full and nothing
+  /// new is scheduled. Timeouts do not catch this, because the body watchdog is
+  /// an IDLE timer and a node trickling bytes keeps resetting it.
+  ///
+  /// So: race a second copy and take whichever arrives first, cancelling the
+  /// loser. Costs one duplicate fetch, and only for a chunk already misbehaving.
+  Future<Uint8List> _awaitHead(_Session session, _ChunkJob head) async {
+    if (!config.hedgeChunks) return head.future;
+
+    final delay = _hedgeDelay(session);
+    try {
+      return await head.future.timeout(delay);
+    } on TimeoutException {
+      // Fall through and hedge.
+    }
+    if (session.cancelled || head.cancelled) return head.future;
+
+    final hedge = _ChunkJob(head.start, head.end)..lastHost = head.lastHost;
+    session.jobs.add(hedge);
+    hedge.future = _fetchChunk(session, hedge);
+    unawaited(hedge.future.then((_) {}, onError: (_) {}));
+    session.hedges++;
+    config.onLog?.call(
+      'hedging ${head.start}-${head.end} after ${delay.inMilliseconds}ms '
+      '(was on ${head.lastHost})',
+    );
+
+    try {
+      return await _race(session, head, hedge);
+    } finally {
+      session.jobs.remove(hedge);
+    }
+  }
+
+  /// First of the two to produce bytes wins; the other is cancelled.
+  Future<Uint8List> _race(_Session session, _ChunkJob a, _ChunkJob b) {
+    final out = Completer<Uint8List>();
+    var failed = 0;
+    Object? lastError;
+
+    void win(_ChunkJob winner, _ChunkJob loser, Uint8List bytes) {
+      if (out.isCompleted) return;
+      if (winner == b) session.hedgeWins++;
+      out.complete(bytes);
+      loser.cancel();
+    }
+
+    void lose(Object error) {
+      lastError = error;
+      // Only give up once BOTH have failed; a hedge exists precisely because
+      // one of them is expected to be unwell.
+      if (++failed == 2 && !out.isCompleted) out.completeError(lastError!);
+    }
+
+    a.future.then((v) => win(a, b, v), onError: lose);
+    b.future.then((v) => win(b, a, v), onError: lose);
+    return out.future;
+  }
+
+  /// How late a chunk must be before it is worth duplicating: a multiple of
+  /// what chunks on this stream have actually been taking, so a slow link is
+  /// not hedged constantly just for being slow.
+  Duration _hedgeDelay(_Session session) {
+    final samples = session.chunkMs;
+    if (samples.length < 3) return config.hedgeAfter;
+    final sorted = List.of(samples)..sort();
+    final median = sorted[sorted.length ~/ 2];
+    final scaled = Duration(
+      milliseconds: (median * config.hedgeMultiplier).round(),
+    );
+    if (scaled < config.hedgeAfter) return config.hedgeAfter;
+    if (scaled > config.maxHedgeAfter) return config.maxHedgeAfter;
+    return scaled;
+  }
   /// Fetches [start]-[end] inclusive, RESUMING where a dropped connection left
   /// off, and rotating mirrors on a genuine mirror fault.
   ///
@@ -530,13 +751,16 @@ class ParallelProxy {
   /// time spends an attempt to re-fetch bytes already in hand. Exhaust the
   /// attempts and the whole ordered stream dies, which the player surfaces only
   /// as "could not open source file".
-  Future<Uint8List> _fetchChunk(_Session session, int start, int end) async {
+  Future<Uint8List> _fetchChunk(_Session session, _ChunkJob job) async {
+    final start = job.start;
+    final end = job.end;
     final expected = end - start + 1;
+    final clock = Stopwatch()..start();
     final out = BytesBuilder(copy: false);
     Object? lastError;
 
     for (var attempt = 0; attempt < config.maxAttemptsPerChunk; attempt++) {
-      if (session.cancelled) throw const _Cancelled();
+      if (session.cancelled || job.cancelled) throw const _Cancelled();
       if (attempt > 0) {
         // Retrying flat out is how a rate-limited CDN turns into a death
         // spiral: the chunk fails, the stream dies, the player re-opens, the
@@ -547,14 +771,24 @@ class ParallelProxy {
         await Future<void>.delayed(
           backoff > config.maxRetryBackoff ? config.maxRetryBackoff : backoff,
         );
-        if (session.cancelled) throw const _Cancelled();
+        if (session.cancelled || job.cancelled) throw const _Cancelled();
       }
       final from = start + out.length;
-      final uri = _pickMirror(session.upstream, spread: config.spreadAcrossMirrors);
+      final uri = _pickMirror(
+        session.upstream,
+        spread: config.spreadAcrossMirrors,
+        avoid: job.lastHost,
+      );
+      job.lastHost = uri.host;
       try {
-        await _fetchInto(session, uri, from, end, out);
+        session.hostsUsed.add(uri.host);
+        await _fetchInto(session, job, uri, from, end, out);
         _recordSuccess(uri);
-        if (out.length == expected) return out.takeBytes();
+        session.chunksOk++;
+        if (out.length == expected) {
+          session.noteChunkMs(clock.elapsedMilliseconds);
+          return out.takeBytes();
+        }
         lastError = HttpException('short read ${out.length}/$expected');
         config.onLog?.call(
           'chunk $start-$end short at ${out.length}/$expected, resuming',
@@ -573,6 +807,7 @@ class ParallelProxy {
         // that is silently dead gets retried until the attempts run out while
         // a healthy backup sits unused. So: brief penalty, long enough to send
         // the next attempt elsewhere, short enough not to sideline it.
+        session.countFailure(e);
         _recordFailure(uri, e);
       }
     }
@@ -583,19 +818,19 @@ class ParallelProxy {
   /// does not open every connection in the same instant.
   Future<Uint8List> _staggered(
     _Session session,
-    int start,
-    int end,
+    _ChunkJob job,
     int position,
   ) async {
     await Future<void>.delayed(config.scheduleStagger * position);
-    if (session.cancelled) throw const _Cancelled();
-    return _fetchChunk(session, start, end);
+    if (session.cancelled || job.cancelled) throw const _Cancelled();
+    return _fetchChunk(session, job);
   }
 
   /// Appends bytes for [from]-[end] onto [out]. On failure [out] keeps whatever
   /// arrived, so the caller can resume rather than start over.
   Future<void> _fetchInto(
     _Session session,
+    _ChunkJob job,
     Uri uri,
     int from,
     int end,
@@ -609,9 +844,9 @@ class ParallelProxy {
     // Registered before the response is awaited, so a cancellation during the
     // header phase tears the request down instead of waiting out the timeout.
     void abort() => req.abort();
-    session.aborts.add(abort);
-    if (session.cancelled) {
-      session.aborts.remove(abort);
+    job.aborts.add(abort);
+    if (session.cancelled || job.cancelled) {
+      job.aborts.remove(abort);
       req.abort();
       throw const _Cancelled();
     }
@@ -620,7 +855,7 @@ class ParallelProxy {
     try {
       resp = await req.close().timeout(config.connectTimeout);
     } finally {
-      session.aborts.remove(abort);
+      job.aborts.remove(abort);
     }
 
     // A node that ignores Range and streams the whole file from zero is worse
@@ -659,7 +894,7 @@ class ParallelProxy {
     final sub = resp.listen(
       (part) {
         if (done.isCompleted) return;
-        if (session.cancelled) {
+        if (session.cancelled || job.cancelled) {
           done.completeError(const _Cancelled());
           return;
         }
@@ -695,15 +930,26 @@ class ParallelProxy {
   /// unhealthy; with it true, chunks round-robin across the healthy hosts. If
   /// every host is blocked we use one anyway - a degraded mirror beats
   /// refusing to serve.
-  Uri _pickMirror(_Upstream upstream, {required bool spread}) {
+  Uri _pickMirror(
+    _Upstream upstream, {
+    required bool spread,
+    String? avoid,
+  }) {
     final mirrors = upstream.mirrors;
     final from = spread ? upstream._cursor : 0;
-    for (var i = 0; i < mirrors.length; i++) {
-      final index = (from + i) % mirrors.length;
-      final uri = mirrors[index];
-      if (_hostHealth[uri.authority]?.usable ?? true) {
-        if (spread) upstream._cursor = (index + 1) % mirrors.length;
-        return uri;
+    for (var pass = 0; pass < 2; pass++) {
+      // First pass honours `avoid` - a hedge is pointless against the same host
+      // that is already being slow. Second pass ignores it, because serving
+      // from a repeat host beats not serving at all.
+      final skipAvoided = pass == 0 && avoid != null;
+      for (var i = 0; i < mirrors.length; i++) {
+        final index = (from + i) % mirrors.length;
+        final uri = mirrors[index];
+        if (skipAvoided && uri.host == avoid) continue;
+        if (_hostHealth[uri.authority]?.usable ?? true) {
+          if (spread) upstream._cursor = (index + 1) % mirrors.length;
+          return uri;
+        }
       }
     }
     return spread
@@ -716,13 +962,16 @@ class ParallelProxy {
     // happens to every mirror on a bad path - it must not accumulate into a
     // block. Only unreachable or wrong-answering hosts do.
     if (error is! _BadMirror && error is! SocketException) return;
-    (_hostHealth[uri.authority] ??= _HostHealth())
-        .fail(config.mirrorPenalty, config.maxHostBlock);
+    (_hostHealth[uri.authority] ??= _HostHealth()).fail(
+      config.mirrorPenalty,
+      config.maxHostBlock,
+    );
   }
 
   void _recordSuccess(Uri uri) {
     _hostHealth[uri.authority]?.succeed();
   }
+
   /// Learns the file size with a one-byte range request. CDNs handle these
   /// more consistently than HEAD, and it doubles as a reachability check.
   Future<int> _resolveLength(_Session session) async {
@@ -731,7 +980,10 @@ class ParallelProxy {
 
     Object? lastError;
     for (var attempt = 0; attempt < config.maxAttemptsPerChunk; attempt++) {
-      final uri = _pickMirror(session.upstream, spread: config.spreadAcrossMirrors);
+      final uri = _pickMirror(
+        session.upstream,
+        spread: config.spreadAcrossMirrors,
+      );
       try {
         final req = await _client.getUrl(uri);
         session.upstream.headers.forEach(req.headers.set);
